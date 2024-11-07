@@ -1,6 +1,0 @@
-set buffer-load-mode map
-
-set ctags-additional-paths '~/yed/src/*'
-
-plugins-add-dir .
-plugin-load flame_graph

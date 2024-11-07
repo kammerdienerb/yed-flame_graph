@@ -1,0 +1,27 @@
+.TH YED-FLAME_GRAPH 7 "YED Plugin Manuals" "" "YED Plugin Manuals"
+.SH NAME
+flame_graph \- View and browse flame graphs.
+.SH CONFIGURATION
+None
+.SH COMMANDS
+.SS flame-graph [PATH]
+Load the flame graph file at PATH for presentation.
+This file must be of the same format that flamegraph.pl accepts.
+A special buffer *flame-graph:PATH will be created and displayed.
+.SS flame-graph-zoom
+Zooms in on the frame under the cursor. Bound to the ENTER key or mouse left button press (if enabled).
+.SS flame-graph-reset-zoom
+Reset the zoom of the flame graph. Bound to the BACKSPACE key or mouse left button press on empty space (if enabled).
+.SS flame-graph-frame-info
+Display a popup with information for the frame under the cursor. Bound to the SPACE key or mouse right button press (if enabled).
+.SH BUFFERS
+*flame-graph:PATH
+.SH NOTES
+.P
+See https://www.brendangregg.com/flamegraphs.html
+
+Assumes truecolor support.
+.SH VERSION
+0.0.1
+.SH KEYWORDS
+flame graph flamegraph profile performance stack

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <functional>
 
 extern "C" {
@@ -136,8 +137,9 @@ struct Flame_Graph {
         };
 
         struct Frame {
-            const char                       *label;
-            size_t                            count = 0;
+            const char                       *label            = NULL;
+            const char                       *cleaned_up_label = NULL;
+            size_t                            count            = 0;
             std::map<const char*,
                      std::shared_ptr<Frame>,
                      String_Compare>          children;
@@ -163,12 +165,12 @@ struct Flame_Graph {
         };
 
 
-        std::shared_ptr<Frame>                    base;
-        std::shared_ptr<Frame>                    true_base;
-        std::string                               name;
-        yed_buffer                               *buffer = NULL;
-        size_t                                    max_depth = 0;
-        std::map<u64, std::map<u64, Frame_Info>>  frame_info;
+        std::shared_ptr<Frame>                  base;
+        std::shared_ptr<Frame>                  true_base;
+        std::string                             name;
+        yed_buffer                             *buffer = NULL;
+        size_t                                  max_depth = 0;
+        std::map<u64, std::vector<Frame_Info>>  frame_info;
 
         Flame_Graph() : true_base(std::make_shared<Frame>()) {
             this->base        = this->true_base;
@@ -215,8 +217,6 @@ struct Flame_Graph {
         }
 
         void write_buffer(size_t width) {
-            DBG("write_buffer(this=%p)", this);
-
             if (this->buffer == NULL) {
                 this->buffer = yed_get_or_create_special_rdonly_buffer((char*)this->name.c_str());
             }
@@ -254,6 +254,8 @@ struct Flame_Graph {
                 } else if (s == "-") {
                     type = Frame_Type::DIVIDER;
                 }
+
+                f->cleaned_up_label = stab.intern(s);
 
 //                 if (first_child) {
 //                     s.insert(s.begin(), '|');
@@ -297,17 +299,120 @@ struct Flame_Graph {
                 info.rand      = rand();
                 info.frame     = f;
 
-                this->frame_info[depth][start_col] = info;
+                this->frame_info[depth].push_back(info);
             };
 
             write_frame(this->base, 1, width, this->max_depth, 1);
         }
+
+        const Frame_Info *get_info(int row, int col) {
+            for (auto &info : this->frame_info[row]) {
+                if (info.start_col <= col && col <= info.end_col) {
+                    return &info;
+                }
+            }
+            return NULL;
+        }
+
+        int zoom(int row, int col, size_t width) {
+            const Frame_Info *info = get_info(row, col);
+
+            if (info == NULL) { return 0; }
+
+            this->base = info->frame;
+            this->write_buffer(width);
+
+            return 1;
+        }
+
+        int reset_zoom(size_t width) {
+            if (this->base != this->true_base) {
+                this->base = this->true_base;
+                this->write_buffer(width);
+                return 1;
+            }
+            return 0;
+        }
 };
+
+struct Popup {
+    struct Popup_Text {
+        std::string text;
+    };
+
+    std::vector<Popup_Text>  texts;
+    std::vector<std::string> lines;
+    array_t                  line_attrs;
+    int                      row;
+    int                      col;
+    int                      max_width;
+
+    Popup(int row, int col) : row(row), col(col), max_width(0) {
+        this->line_attrs = array_make(array_t);
+    }
+
+    ~Popup() {
+        array_t *it;
+
+        array_traverse(this->line_attrs, it) {
+            array_free(*it);
+        }
+
+        array_free(this->line_attrs);
+    }
+
+    void add_text(std::string &&text) {
+        this->texts.emplace_back(Popup_Text{ std::move(text) });
+    }
+
+    void finish() {
+        for (const auto &t : this->texts) {
+            const auto &text  = t.text;
+
+            std::istringstream is(text);
+
+            std::string line;
+            for (int l = 0; getline(is, line); l += 1) {
+                int width = yed_get_string_width(line.c_str());
+                if (width > this->max_width) { this->max_width = width; }
+
+                array_t col_attrs = array_make(yed_attrs);
+                for (int i = 0; i < width; i += 1) {
+                    yed_attrs a = ZERO_ATTR;
+                    array_push(col_attrs, a);
+                }
+                array_push(this->line_attrs, col_attrs);
+
+                this->lines.push_back(line);
+            }
+        }
+    }
+};
+
+static std::unique_ptr<Popup> popup;
 
 static std::map<std::string, Flame_Graph> flame_graphs;
 
 
 static yed_plugin *Self;
+
+static Flame_Graph *graph_from_buffer(yed_buffer *buff) {
+    if (buff == NULL) { return NULL; }
+
+    for (auto &pair : flame_graphs) {
+        auto &g = pair.second;
+        if (g.buffer == buff) {
+            return &g;
+        }
+    }
+
+    return NULL;
+}
+
+static Flame_Graph *graph_in_frame(yed_frame *f) {
+    return graph_from_buffer(f->buffer);
+}
+
 
 static void flame_graph(int n_args, char **args) {
     if (n_args != 1) {
@@ -332,11 +437,197 @@ static void flame_graph(int n_args, char **args) {
         graph.add_flame(std::move(line));
     }
 
+    popup.reset();
+
     graph.write_buffer(ys->active_frame == NULL ? 120 : ys->active_frame->width);
 
     YEXE("buffer", (char*)graph.name.c_str());
     YEXE("cursor-buffer-end");
     YEXE("cursor-line-begin");
+}
+
+static void flame_graph_zoom(int n_args, char **args) {
+    yed_frame *frame;
+
+    if (n_args != 0) {
+        yed_cerr("expected 0 argument, but got %d", n_args);
+        return;
+    }
+
+    frame = ys->active_frame;
+    if (frame == NULL) { return; }
+
+    Flame_Graph *graph = graph_in_frame(frame);
+
+    if (graph == NULL) {
+        yed_cerr("no flame graph!");
+        return;
+    }
+
+    popup.reset();
+
+    if (graph->zoom(frame->cursor_line, frame->cursor_col, frame->width)) {
+        YEXE("cursor-buffer-end");
+        YEXE("cursor-line-begin");
+    }
+}
+
+static void flame_graph_reset_zoom(int n_args, char **args) {
+    yed_frame *frame;
+
+    if (n_args != 0) {
+        yed_cerr("expected 0 argument, but got %d", n_args);
+        return;
+    }
+
+    frame = ys->active_frame;
+    if (frame == NULL) { return; }
+
+    Flame_Graph *graph = graph_in_frame(frame);
+
+    if (graph == NULL) {
+        yed_cerr("no flame graph!");
+        return;
+    }
+
+    popup.reset();
+
+    if (graph->reset_zoom(frame->width)) {
+        YEXE("cursor-buffer-end");
+        YEXE("cursor-line-begin");
+    }
+}
+
+static void info_popup(Flame_Graph *graph, int row, int col) {
+    const Flame_Graph::Frame_Info *info = graph->get_info(row, col);
+
+    if (info == NULL) { return; }
+
+    popup = std::make_unique<Popup>(row, col);
+
+    popup->add_text(info->frame->cleaned_up_label);
+
+    char buff[512];
+    snprintf(buff, sizeof(buff), "%zu samples (%.2f%% of total shown)", info->frame->count, 100.0 * (float)info->frame->count / (float)graph->base->count);
+    popup->add_text(buff);
+
+    popup->finish();
+}
+
+static void flame_graph_frame_info(int n_args, char **args) {
+    yed_frame *frame;
+
+    if (n_args != 0) {
+        yed_cerr("expected 0 argument, but got %d", n_args);
+        return;
+    }
+
+    frame = ys->active_frame;
+    if (frame == NULL) { return; }
+
+    Flame_Graph *graph = graph_in_frame(frame);
+
+    if (graph == NULL) {
+        yed_cerr("no flame graph!");
+        return;
+    }
+
+    info_popup(graph, frame->cursor_line, frame->cursor_col);
+}
+
+static void draw(yed_event *event) {
+    if (!popup || popup->lines.size() == 0) { return; }
+
+    if (ys->active_frame == NULL || ys->active_frame->buffer == NULL) { return; }
+
+    yed_frame *f = ys->active_frame;
+    int        y = yed_frame_line_to_y(f, popup->row);
+    if (y <= 0) { return; }
+
+    yed_line *line = yed_buff_get_line(f->buffer, popup->row);
+    if (line == NULL) { return; }
+
+    int col = popup->col;
+    if (col <= f->buffer_x_offset || col > f->buffer_x_offset + f->width) { return; }
+
+    int x = f->left + col - (f->buffer_x_offset + 1);
+
+    yed_attrs attrs = ZERO_ATTR;
+    if (yed_active_style_get_popup().flags) {
+        attrs = yed_parse_attrs("&active &popup");
+    } else {
+        attrs = yed_parse_attrs("&active &associate");
+    }
+
+    int n_lines     = popup->lines.size();
+    int extra_lines = 2;
+    int width       = popup->max_width;
+
+    if (y > n_lines + extra_lines) {
+        y -= n_lines + extra_lines;
+    } else {
+        y += 1;
+    }
+
+    yed_set_attr(attrs);
+
+    for (int i = 0; i < n_lines + extra_lines; i += 1) {
+        yed_set_cursor(y + i, x);
+        if (i == 0) {
+            yed_screen_print_over("┌");
+        } else if (i == n_lines + extra_lines - 1) {
+            yed_screen_print_over("└");
+        } else {
+            yed_screen_print_over("│");
+        }
+        for (int j = 1; j < width + 1; j += 1) {
+            yed_set_cursor(y + i, x + j);
+            if (i == 0 || i == n_lines + extra_lines - 1) {
+                yed_screen_print_over("─");
+            }
+        }
+        yed_set_cursor(y + i, x + width + 1);
+        if (i == 0) {
+            yed_screen_print_over("┐");
+        } else if (i == n_lines + extra_lines - 1) {
+            yed_screen_print_over("┘");
+        } else {
+            yed_screen_print_over("│");
+        }
+    }
+
+    y += 1;
+
+    int l = 0;
+    for (const auto & line : popup->lines) {
+        yed_glyph *git;
+        int        c = 1;
+        array_t   *line_attrs = (array_t*)array_item(popup->line_attrs, l);
+
+        yed_glyph_traverse(line.c_str(), git) {
+            yed_set_cursor(y, x + c);
+
+            yed_attrs a = attrs;
+            yed_combine_attrs(&a, (yed_attrs*)array_item(*line_attrs, c - 1));
+            yed_set_attr(a);
+            yed_screen_print_n_over(&git->c, yed_get_glyph_len(git));
+
+            c += yed_get_glyph_width(git);
+        }
+
+        for (; c < width + 1; c += 1) {
+            yed_set_cursor(y, x + c);
+            yed_set_attr(attrs);
+            yed_screen_print_n_over(" ", 1);
+        }
+
+        y += 1;
+        l += 1;
+    }
+}
+
+static void move(yed_event *event) {
+    popup.reset();
 }
 
 static void fit(yed_event *event) {
@@ -365,6 +656,7 @@ static void fit(yed_event *event) {
             g.write_buffer(width);
         }
     }
+    popup.reset();
 }
 
 static void hsv_to_rgb(float h, float s, float v,
@@ -396,124 +688,144 @@ static void hsv_to_rgb(float h, float s, float v,
 
 static void color(yed_event *event) {
     yed_frame  *frame;
-    yed_buffer *buff;
 
     frame = event->frame;
     if (frame == NULL) { return; }
 
-    buff = frame->buffer;
-    if (buff == NULL) { return; }
+    Flame_Graph *graph = graph_in_frame(frame);
 
-    for (auto &pair : flame_graphs) {
-        auto &g = pair.second;
+    if (graph == NULL) { return; }
 
-        if (g.buffer != buff) { continue; }
+    for (auto &info : graph->frame_info[event->row]) {
+        yed_attrs attrs = ZERO_ATTR;
 
-        for (auto &pair : g.frame_info[event->row]) {
-            auto &info = pair.second;
+        if (ys->current_search != NULL
+        &&  ys->current_search[0]
+        &&  strstr(info.frame->label, ys->current_search) != NULL) {
 
-            yed_attrs attrs = ZERO_ATTR;
+            attrs = yed_parse_attrs("&black bg ff00ff");
+        } else {
+            using Frame_Type = Flame_Graph::Frame_Type;
 
-            if (ys->current_search != NULL
-            &&  ys->current_search[0]
-            &&  strstr(info.frame->label, ys->current_search) != NULL) {
+            float h, s = 0.5, v = 0.75;
 
-                attrs = yed_parse_attrs("&black bg ff00ff");
-            } else {
-                using Frame_Type = Flame_Graph::Frame_Type;
-
-                float h, s = 0.5, v = 0.75;
-
-                switch (info.type) {
-                    case Frame_Type::GPU_INST:
-                        h = 0.6 * M_PI;
-                        break;
-                    case Frame_Type::GPU_SYMBOL:
-                        h = M_PI;
-                        break;
-                    case Frame_Type::KERNEL:
-                        h = 0.15 * M_PI;
-                        break;
-                    case Frame_Type::CPP:
-                        h = 0.25 * M_PI;
-                        break;
-                    case Frame_Type::PYTHON:
-                        h = 0.0;
-                        s = 0.25;
-                        break;
-                    case Frame_Type::DIVIDER:
-                        h = 0.0;
-                        s = 0.0;
-                        v = 0.5;
-                        break;
-                    default:
-                        h = 0.0;
-                        break;
-                }
-
-                if (info.type != Frame_Type::DIVIDER) {
-                    v += ((float)((info.rand % 1000) + 1) / 1000.0) * 0.15;
-                }
-
-                int r, g, b;
-                hsv_to_rgb(h, s, v, &r, &g, &b);
-
-                char attr_string[512];
-                snprintf(attr_string, sizeof(attr_string), "&black bg %02x%02x%02x", r, g, b);
-                DBG("%s", attr_string);
-                attrs = yed_parse_attrs(attr_string);
+            switch (info.type) {
+                case Frame_Type::GPU_INST:
+                    h = 0.6 * M_PI;
+                    break;
+                case Frame_Type::GPU_SYMBOL:
+                    h = M_PI;
+                    break;
+                case Frame_Type::KERNEL:
+                    h = 0.15 * M_PI;
+                    break;
+                case Frame_Type::CPP:
+                    h = 0.25 * M_PI;
+                    break;
+                case Frame_Type::PYTHON:
+                    h = 0.0;
+                    s = 0.25;
+                    break;
+                case Frame_Type::DIVIDER:
+                    h = 0.0;
+                    s = 0.0;
+                    v = 0.5;
+                    break;
+                default:
+                    h = 0.0;
+                    break;
             }
 
-            for (int col = info.start_col; col <= info.end_col; col += 1) {
-                yed_eline_combine_col_attrs(event, col, &attrs);
+            if (info.type != Frame_Type::DIVIDER) {
+                v += ((float)((info.rand % 1000) + 1) / 1000.0) * 0.15;
             }
+
+            int r, g, b;
+            hsv_to_rgb(h, s, v, &r, &g, &b);
+
+            char attr_string[512];
+            snprintf(attr_string, sizeof(attr_string), "fg 000000 bg %02x%02x%02x", r, g, b);
+            attrs = yed_parse_attrs(attr_string);
         }
 
-        break;
+        for (int col = info.start_col; col <= info.end_col; col += 1) {
+            yed_eline_combine_col_attrs(event, col, &attrs);
+        }
+    }
+}
+
+static void focus(yed_event *event) {
+    yed_buffer *to_buff = NULL;
+
+    if (event->kind == EVENT_FRAME_PRE_SET_BUFFER && event->frame == ys->active_frame) {
+        to_buff = event->buffer;
+    } else if (event->kind == EVENT_FRAME_PRE_ACTIVATE) {
+        if (event->frame == ys->active_frame) { return; }
+        to_buff = event->frame->buffer;
+    }
+
+    if (graph_from_buffer(to_buff) == NULL) {
+        yed_disable_key_map("flame-graph");
+    } else {
+        yed_enable_key_map("flame-graph");
     }
 }
 
 static void key(yed_event *event) {
-    yed_frame  *frame;
-    yed_buffer *buff;
+    yed_frame   *frame;
+    Flame_Graph *graph = NULL;
 
-    if (ys->interactive_command
-    ||  !ys->active_frame) {
+    if (ys->interactive_command) {
+        return;
+    }
+
+    if (!IS_MOUSE(event->key)
+    ||  MOUSE_KIND(event->key) != MOUSE_PRESS) {
+
+        return;
+    }
+
+    if (MOUSE_BUTTON(event->key) != MOUSE_BUTTON_LEFT
+    &&  MOUSE_BUTTON(event->key) != MOUSE_BUTTON_RIGHT) {
+
         return;
     }
 
     frame = ys->active_frame;
     if (frame == NULL) { return; }
 
-    buff = frame->buffer;
-    if (buff == NULL) { return; }
+    graph = graph_in_frame(frame);
+    if (graph == NULL) { return; }
 
-    if (event->key != ENTER) { return; }
+    int row = MOUSE_ROW(event->key);
+    int col = MOUSE_COL(event->key);
 
-    int row = frame->cursor_line;
-    int col = frame->cursor_col;
+    if (row < frame->top  || row > frame->top  + frame->height - 1
+    ||  col < frame->left || col > frame->left + frame->width  - 1) {
 
-    for (auto &pair : flame_graphs) {
-        auto &g = pair.second;
-
-        if (g.buffer != buff) { continue; }
-
-        for (auto &pair : g.frame_info[row]) {
-            auto &info = pair.second;
-
-            if (info.start_col <= col || col <= info.end_col) {
-                g.base = info.frame;
-                g.write_buffer(frame->width);
-                break;
-            }
-        }
-
-        break;
+        return;
     }
 
-    return;
+    row = row - frame->top + frame->buffer_y_offset + 1;
+    col = col - frame->left + frame->buffer_x_offset - frame->gutter_width + 1;
 
-found:;
+    if (MOUSE_BUTTON(event->key) == MOUSE_BUTTON_LEFT) {
+        if (graph->get_info(row, col) == NULL) {
+            graph->reset_zoom(frame->width);
+            YEXE("cursor-buffer-end");
+            YEXE("cursor-line-begin");
+        } else {
+            graph->zoom(row, col, frame->width);
+            YEXE("cursor-buffer-end");
+            YEXE("cursor-line-begin");
+        }
+        popup.reset();
+    } else if (MOUSE_BUTTON(event->key) == MOUSE_BUTTON_RIGHT) {
+        popup.reset();
+        info_popup(graph, row, col);
+    }
+
+    event->cancel = 1;
 }
 
 extern "C"
@@ -528,15 +840,21 @@ int yed_plugin_boot(yed_plugin *self) {
     std::map<void(*)(yed_event*), std::vector<yed_event_kind_t> > event_handlers = {
         { fit,   { EVENT_FRAME_POST_RESIZE, EVENT_TERMINAL_RESIZED,
                    EVENT_FRAME_POST_DELETE, EVENT_FRAME_PRE_SET_BUFFER,
-                   EVENT_FRAME_POST_SET_BUFFER } },
-        { color, { EVENT_LINE_PRE_DRAW } },
-        { key,   { EVENT_KEY_PRESSED   } }};
+                   EVENT_FRAME_POST_SET_BUFFER                          } },
+        { color, { EVENT_LINE_PRE_DRAW                                  } },
+        { key,   { EVENT_KEY_PRESSED                                    } },
+        { focus, { EVENT_FRAME_PRE_SET_BUFFER, EVENT_FRAME_PRE_ACTIVATE } },
+        { move,  { EVENT_CURSOR_POST_MOVE                               } },
+        { draw,  { EVENT_PRE_DIRECT_DRAWS                               } }};
 
     std::map<const char*, const char*> vars = {
-        { "flame-graph-debug-log", "ON" }};
+        { "flame-graph-debug-log", "OFF" }};
 
     std::map<const char*, void(*)(int, char**)> cmds = {
-        { "flame-graph", flame_graph }};
+        { "flame-graph",            flame_graph            },
+        { "flame-graph-zoom",       flame_graph_zoom       },
+        { "flame-graph-reset-zoom", flame_graph_reset_zoom },
+        { "flame-graph-frame-info", flame_graph_frame_info }};
 
     for (auto &pair : event_handlers) {
         for (auto evt : pair.second) {
@@ -555,6 +873,13 @@ int yed_plugin_boot(yed_plugin *self) {
         yed_plugin_set_command(self, pair.first, pair.second);
     }
     yed_plugin_set_completion(self, "flame-graph-compl-arg-0", yed_get_completion("file"));
+
+    yed_plugin_add_key_map(self, "flame-graph");
+    yed_plugin_map_bind_key(self, "flame-graph", ENTER,     "flame-graph-zoom",       0, NULL);
+    yed_plugin_map_bind_key(self, "flame-graph", BACKSPACE, "flame-graph-reset-zoom", 0, NULL);
+    yed_plugin_map_bind_key(self, "flame-graph", ' ',       "flame-graph-frame-info", 0, NULL);
+
+    yed_disable_key_map("flame-graph");
 
     yed_plugin_set_unload_fn(self, unload);
 
