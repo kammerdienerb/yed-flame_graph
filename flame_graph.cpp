@@ -767,6 +767,9 @@ static void focus(yed_event *event) {
     if (graph_from_buffer(to_buff) == NULL) {
         yed_disable_key_map("flame-graph");
     } else {
+        yed_plugin_map_bind_key(Self, "flame-graph", ENTER,     "flame-graph-zoom",       0, NULL);
+        yed_plugin_map_bind_key(Self, "flame-graph", BACKSPACE, "flame-graph-reset-zoom", 0, NULL);
+        yed_plugin_map_bind_key(Self, "flame-graph", ' ',       "flame-graph-frame-info", 0, NULL);
         yed_enable_key_map("flame-graph");
     }
 }
@@ -875,10 +878,6 @@ int yed_plugin_boot(yed_plugin *self) {
     yed_plugin_set_completion(self, "flame-graph-compl-arg-0", yed_get_completion("file"));
 
     yed_plugin_add_key_map(self, "flame-graph");
-    yed_plugin_map_bind_key(self, "flame-graph", ENTER,     "flame-graph-zoom",       0, NULL);
-    yed_plugin_map_bind_key(self, "flame-graph", BACKSPACE, "flame-graph-reset-zoom", 0, NULL);
-    yed_plugin_map_bind_key(self, "flame-graph", ' ',       "flame-graph-frame-info", 0, NULL);
-
     yed_disable_key_map("flame-graph");
 
     yed_plugin_set_unload_fn(self, unload);
