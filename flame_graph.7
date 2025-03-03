@@ -2,7 +2,8 @@
 .SH NAME
 flame_graph \- View and browse flame graphs.
 .SH CONFIGURATION
-None
+.SS flame-graph-bind-mouse [ yes / no ]
+Whether or not to bind mouse press events for flame graph actions. Default: yes
 .SH COMMANDS
 .SS flame-graph [PATH]
 Load the flame graph file at PATH for presentation.
@@ -11,7 +12,9 @@ A special buffer *flame-graph:PATH will be created and displayed.
 .SS flame-graph-zoom
 Zooms in on the frame under the cursor. Bound to the ENTER key or mouse left button press (if enabled).
 .SS flame-graph-reset-zoom
-Reset the zoom of the flame graph. Bound to the BACKSPACE key or mouse left button press on empty space (if enabled).
+Reset the zoom of the flame graph. Bound to the ESC key.
+.SS flame-graph-return-zoom
+Return to the previous zoom level. Bound to the BACKSPACE key or mouse left button press on empty space (if enabled).
 .SS flame-graph-frame-info
 Display a popup with information for the frame under the cursor. Bound to the SPACE key or mouse right button press (if enabled).
 .SH BUFFERS

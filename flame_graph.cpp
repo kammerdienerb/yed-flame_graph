@@ -143,12 +143,14 @@ struct Flame_Graph {
             std::map<const char*,
                      std::shared_ptr<Frame>,
                      String_Compare>          children;
+            Frame                            *parent;
 
             std::shared_ptr<Frame> add_frame(const char *label, size_t count) {
                 auto f = this->children[label];
                 if (!f) {
                     f = this->children[label] = std::make_shared<Frame>();
-                    f->label = label;
+                    f->parent = this;
+                    f->label  = label;
                 }
                 f->count += count;
                 return f;
@@ -165,19 +167,21 @@ struct Flame_Graph {
         };
 
 
-        std::shared_ptr<Frame>                  base;
         std::shared_ptr<Frame>                  true_base;
+        std::vector<std::shared_ptr<Frame>>     base_stack;
         std::string                             name;
         yed_buffer                             *buffer = NULL;
         size_t                                  max_depth = 0;
         std::map<u64, std::vector<Frame_Info>>  frame_info;
 
         Flame_Graph() : true_base(std::make_shared<Frame>()) {
-            this->base        = this->true_base;
-            this->base->label = stab.intern("all");
+            this->base_stack.push_back(this->true_base);
+            this->true_base->label = stab.intern("all");
         }
 
         Flame_Graph(const Flame_Graph&) = delete;
+
+        std::shared_ptr<Frame> get_base() { return this->base_stack.back(); }
 
         void add_flame(std::string &&s) {
             if (s.size() == 0) { return; }
@@ -194,7 +198,7 @@ struct Flame_Graph {
             size_t count = std::stoll(count_string);
 
             const char *label;
-            auto f = this->base;
+            auto f = this->get_base();
 
             f->count += count;
 
@@ -302,7 +306,7 @@ struct Flame_Graph {
                 this->frame_info[depth].push_back(info);
             };
 
-            write_frame(this->base, 1, width, this->max_depth, 1);
+            write_frame(this->get_base(), 1, width, this->max_depth, 1);
         }
 
         const Frame_Info *get_info(int row, int col) {
@@ -319,19 +323,29 @@ struct Flame_Graph {
 
             if (info == NULL) { return 0; }
 
-            this->base = info->frame;
+            this->base_stack.push_back(info->frame);
             this->write_buffer(width);
 
             return 1;
         }
 
         int reset_zoom(size_t width) {
-            if (this->base != this->true_base) {
-                this->base = this->true_base;
-                this->write_buffer(width);
-                return 1;
-            }
-            return 0;
+            if (this->get_base() == this->true_base) { return 0; }
+
+            this->base_stack.clear();
+            this->base_stack.push_back(this->true_base);
+            this->write_buffer(width);
+
+            return 1;
+        }
+
+        int return_zoom(size_t width) {
+            if (this->get_base() == this->true_base) { return 0; }
+
+            this->base_stack.pop_back();
+            this->write_buffer(width);
+
+            return 1;
         }
 };
 
@@ -392,6 +406,8 @@ struct Popup {
 static std::unique_ptr<Popup> popup;
 
 static std::map<std::string, Flame_Graph> flame_graphs;
+
+static std::unordered_set<Flame_Graph::Frame*> search_match_frames;
 
 
 static yed_plugin *Self;
@@ -498,6 +514,32 @@ static void flame_graph_reset_zoom(int n_args, char **args) {
     }
 }
 
+static void flame_graph_return_zoom(int n_args, char **args) {
+    yed_frame *frame;
+
+    if (n_args != 0) {
+        yed_cerr("expected 0 argument, but got %d", n_args);
+        return;
+    }
+
+    frame = ys->active_frame;
+    if (frame == NULL) { return; }
+
+    Flame_Graph *graph = graph_in_frame(frame);
+
+    if (graph == NULL) {
+        yed_cerr("no flame graph!");
+        return;
+    }
+
+    popup.reset();
+
+    if (graph->return_zoom(frame->width)) {
+        YEXE("cursor-buffer-end");
+        YEXE("cursor-line-begin");
+    }
+}
+
 static void info_popup(Flame_Graph *graph, int row, int col) {
     const Flame_Graph::Frame_Info *info = graph->get_info(row, col);
 
@@ -508,7 +550,11 @@ static void info_popup(Flame_Graph *graph, int row, int col) {
     popup->add_text(info->frame->cleaned_up_label);
 
     char buff[512];
-    snprintf(buff, sizeof(buff), "%zu samples (%.2f%% of total shown)", info->frame->count, 100.0 * (float)info->frame->count / (float)graph->base->count);
+    if (graph->get_base() == graph->true_base) {
+        snprintf(buff, sizeof(buff), "%zu samples (%.2f%% of all)", info->frame->count, 100.0 * (float)info->frame->count / (float)graph->get_base()->count);
+    } else {
+        snprintf(buff, sizeof(buff), "%zu samples (%.2f%% of total shown, %.2f%% of all)", info->frame->count, 100.0 * (float)info->frame->count / (float)graph->get_base()->count, 100.0 * (float)info->frame->count / (float)graph->true_base->count);
+    }
     popup->add_text(buff);
 
     popup->finish();
@@ -570,6 +616,11 @@ static void draw(yed_event *event) {
     int extra_lines = 2;
     int width       = popup->max_width;
 
+    if (width + 2 > f->width) {
+        width = f->width - 2;
+    }
+    width = MAX(width, 1);
+
     if (y > n_lines + extra_lines) {
         y -= n_lines + extra_lines;
     } else {
@@ -609,14 +660,23 @@ static void draw(yed_event *event) {
     for (const auto & line : popup->lines) {
         yed_glyph *git;
         int        c = 1;
+        int        too_long = yed_get_string_width(line.c_str()) > width;
         array_t   *line_attrs = (array_t*)array_item(popup->line_attrs, l);
 
         yed_glyph_traverse(line.c_str(), git) {
-            if (c == width) { break; }
+            if (c > width) { break; }
 
             yed_set_cursor(y, x + c);
 
             yed_attrs a = attrs;
+
+            if (too_long && c == width - 2) {
+                yed_set_attr(attrs);
+                yed_screen_print_n_over("...", 3);
+                c += 3;
+                break;
+            }
+
             yed_combine_attrs(&a, (yed_attrs*)array_item(*line_attrs, c - 1));
             yed_set_attr(a);
             yed_screen_print_n_over(&git->c, yed_get_glyph_len(git));
@@ -695,6 +755,41 @@ static void hsv_to_rgb(float h, float s, float v,
     *b = (B + m) * 255;
 }
 
+static int search(Flame_Graph::Frame *f) {
+    int match = 0;
+
+    if (strstr(f->label, ys->current_search) != NULL) {
+        match = 1;
+    }
+
+    for (auto pair : f->children) {
+        match |= !!search(pair.second.get());
+    }
+
+    if (match) {
+        search_match_frames.insert(f);
+    }
+
+    return match;
+}
+
+static void update(yed_event *event) {
+    search_match_frames.clear();
+
+    if (ys->current_search == NULL || ys->current_search[0] == 0) {
+        return;
+    }
+
+    yed_frame *frame = event->frame;
+    if (frame == NULL) { return; }
+
+    Flame_Graph *graph = graph_in_frame(frame);
+
+    if (graph == NULL) { return; }
+
+    search(graph->get_base().get());
+}
+
 static void color(yed_event *event) {
     yed_frame  *frame;
 
@@ -713,6 +808,13 @@ static void color(yed_event *event) {
         &&  strstr(info.frame->label, ys->current_search) != NULL) {
 
             attrs = yed_parse_attrs("&black bg ff00ff");
+        } else if (frame == ys->active_frame
+               &&  event->row == frame->cursor_line
+               &&  info.start_col <= frame->cursor_col && frame->cursor_col <= info.end_col) {
+
+            attrs = yed_parse_attrs("&black bg ff0000");
+        } else if (search_match_frames.find(info.frame.get()) != search_match_frames.end()) {
+            attrs = yed_parse_attrs("&black bg 7722ff");
         } else {
             using Frame_Type = Flame_Graph::Frame_Type;
 
@@ -776,9 +878,10 @@ static void focus(yed_event *event) {
     if (graph_from_buffer(to_buff) == NULL) {
         yed_disable_key_map("flame-graph");
     } else {
-        yed_plugin_map_bind_key(Self, "flame-graph", ENTER,     "flame-graph-zoom",       0, NULL);
-        yed_plugin_map_bind_key(Self, "flame-graph", BACKSPACE, "flame-graph-reset-zoom", 0, NULL);
-        yed_plugin_map_bind_key(Self, "flame-graph", ' ',       "flame-graph-frame-info", 0, NULL);
+        yed_plugin_map_bind_key(Self, "flame-graph", ENTER,     "flame-graph-zoom",        0, NULL);
+        yed_plugin_map_bind_key(Self, "flame-graph", ESC,       "flame-graph-reset-zoom",  0, NULL);
+        yed_plugin_map_bind_key(Self, "flame-graph", BACKSPACE, "flame-graph-return-zoom", 0, NULL);
+        yed_plugin_map_bind_key(Self, "flame-graph", ' ',       "flame-graph-frame-info",  0, NULL);
         yed_enable_key_map("flame-graph");
     }
 }
@@ -786,6 +889,8 @@ static void focus(yed_event *event) {
 static void key(yed_event *event) {
     yed_frame   *frame;
     Flame_Graph *graph = NULL;
+
+    if (!yed_var_is_truthy("flame-graph-bind-mouse")) { return; }
 
     if (ys->interactive_command) {
         return;
@@ -823,7 +928,7 @@ static void key(yed_event *event) {
 
     if (MOUSE_BUTTON(event->key) == MOUSE_BUTTON_LEFT) {
         if (graph->get_info(row, col) == NULL) {
-            graph->reset_zoom(frame->width);
+            graph->return_zoom(frame->width);
             YEXE("cursor-buffer-end");
             YEXE("cursor-line-begin");
         } else {
@@ -850,23 +955,26 @@ int yed_plugin_boot(yed_plugin *self) {
     Self = self;
 
     std::map<void(*)(yed_event*), std::vector<yed_event_kind_t> > event_handlers = {
-        { fit,   { EVENT_FRAME_POST_RESIZE, EVENT_TERMINAL_RESIZED,
-                   EVENT_FRAME_POST_DELETE, EVENT_FRAME_PRE_SET_BUFFER,
-                   EVENT_FRAME_POST_SET_BUFFER                          } },
-        { color, { EVENT_LINE_PRE_DRAW                                  } },
-        { key,   { EVENT_KEY_PRESSED                                    } },
-        { focus, { EVENT_FRAME_PRE_SET_BUFFER, EVENT_FRAME_PRE_ACTIVATE } },
-        { move,  { EVENT_CURSOR_POST_MOVE                               } },
-        { draw,  { EVENT_PRE_DIRECT_DRAWS                               } }};
+        { fit,    { EVENT_FRAME_POST_RESIZE, EVENT_TERMINAL_RESIZED,
+                    EVENT_FRAME_POST_DELETE, EVENT_FRAME_PRE_SET_BUFFER,
+                    EVENT_FRAME_POST_SET_BUFFER                          } },
+        { update, { EVENT_FRAME_PRE_UPDATE                               } },
+        { color,  { EVENT_LINE_PRE_DRAW                                  } },
+        { key,    { EVENT_KEY_PRESSED                                    } },
+        { focus,  { EVENT_FRAME_PRE_SET_BUFFER, EVENT_FRAME_PRE_ACTIVATE } },
+        { move,   { EVENT_CURSOR_POST_MOVE                               } },
+        { draw,   { EVENT_PRE_DIRECT_DRAWS                               } }};
 
     std::map<const char*, const char*> vars = {
-        { "flame-graph-debug-log", "OFF" }};
+        { "flame-graph-debug-log",  "OFF" },
+        { "flame-graph-bind-mouse", "ON"  }};
 
     std::map<const char*, void(*)(int, char**)> cmds = {
-        { "flame-graph",            flame_graph            },
-        { "flame-graph-zoom",       flame_graph_zoom       },
-        { "flame-graph-reset-zoom", flame_graph_reset_zoom },
-        { "flame-graph-frame-info", flame_graph_frame_info }};
+        { "flame-graph",             flame_graph             },
+        { "flame-graph-zoom",        flame_graph_zoom        },
+        { "flame-graph-reset-zoom",  flame_graph_reset_zoom  },
+        { "flame-graph-return-zoom", flame_graph_return_zoom },
+        { "flame-graph-frame-info",  flame_graph_frame_info }};
 
     for (auto &pair : event_handlers) {
         for (auto evt : pair.second) {
