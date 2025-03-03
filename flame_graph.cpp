@@ -548,6 +548,13 @@ static void draw(yed_event *event) {
     if (line == NULL) { return; }
 
     int col = popup->col;
+
+    int end = col + popup->max_width + 2 - 1;
+    if (end > f->width) {
+        col -= end - f->width;
+        if (col <= 0) { col = 1; }
+    }
+
     if (col <= f->buffer_x_offset || col > f->buffer_x_offset + f->width) { return; }
 
     int x = f->left + col - (f->buffer_x_offset + 1);
@@ -605,6 +612,8 @@ static void draw(yed_event *event) {
         array_t   *line_attrs = (array_t*)array_item(popup->line_attrs, l);
 
         yed_glyph_traverse(line.c_str(), git) {
+            if (c == width) { break; }
+
             yed_set_cursor(y, x + c);
 
             yed_attrs a = attrs;
@@ -615,7 +624,7 @@ static void draw(yed_event *event) {
             c += yed_get_glyph_width(git);
         }
 
-        for (; c < width + 1; c += 1) {
+        for (; c <= width; c += 1) {
             yed_set_cursor(y, x + c);
             yed_set_attr(attrs);
             yed_screen_print_n_over(" ", 1);
