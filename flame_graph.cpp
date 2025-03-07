@@ -460,6 +460,9 @@ static void flame_graph(int n_args, char **args) {
     auto &graph = flame_graphs[args[0]];
     graph.name = std::string("*flame-graph:") + args[0] + "";
 
+
+    u64 start = measure_time_now_ms();
+
     std::string line;
     while (std::getline(f, line)) {
         graph.add_flame(std::move(line));
@@ -468,6 +471,8 @@ static void flame_graph(int n_args, char **args) {
     popup.reset();
 
     graph.write_buffer(ys->active_frame == NULL ? 120 : ys->active_frame->width);
+
+    DBG("took %llu ns to build %s", measure_time_now_ms() - start, graph.name.c_str());
 
     YEXE("buffer", (char*)graph.name.c_str());
     YEXE("cursor-buffer-end");
