@@ -8,6 +8,7 @@
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <algorithm>
 
 extern "C" {
 #include <yed/plugin.h>
@@ -145,7 +146,7 @@ struct Flame_Graph {
                      String_Compare>          children;
             Frame                            *parent;
 
-            std::shared_ptr<Frame> add_frame(const char *label, size_t count) {
+            Frame *add_frame(const char *label, size_t count) {
                 auto f = this->children[label];
                 if (!f) {
                     f = this->children[label] = std::make_shared<Frame>();
@@ -153,35 +154,35 @@ struct Flame_Graph {
                     f->label  = label;
                 }
                 f->count += count;
-                return f;
+                return f.get();
             }
         };
 
         struct Frame_Info {
-            u64                     row;
-            u64                     start_col;
-            u64                     end_col;
-            Frame_Type              type;
-            u64                     rand;
-            std::shared_ptr<Frame>  frame;
+            u64         row;
+            u64         start_col;
+            u64         end_col;
+            Frame_Type  type;
+            u64         rand;
+            Frame      *frame;
         };
 
 
         std::shared_ptr<Frame>                  true_base;
-        std::vector<std::shared_ptr<Frame>>     base_stack;
+        std::vector<Frame*>                     base_stack;
         std::string                             name;
         yed_buffer                             *buffer = NULL;
         size_t                                  max_depth = 0;
         std::map<u64, std::vector<Frame_Info>>  frame_info;
 
         Flame_Graph() : true_base(std::make_shared<Frame>()) {
-            this->base_stack.push_back(this->true_base);
+            this->base_stack.push_back(this->true_base.get());
             this->true_base->label = stab.intern("all");
         }
 
         Flame_Graph(const Flame_Graph&) = delete;
 
-        std::shared_ptr<Frame> get_base() { return this->base_stack.back(); }
+        Frame *get_base() { return this->base_stack.back(); }
 
         void add_flame(std::string &&s) {
             if (s.size() == 0) { return; }
@@ -195,7 +196,7 @@ struct Flame_Graph {
 
             if (count_string.empty()) { return; }
 
-            size_t count = std::stoll(count_string);
+            size_t count = std::stoull(count_string);
 
             const char *label;
             auto f = this->get_base();
@@ -204,7 +205,7 @@ struct Flame_Graph {
 
             size_t last  = 0;
             size_t next  = 0;
-            size_t depth = 0;
+            size_t depth = 1; /* Implicit 'all' frame. */
             std::string_view sv(s);
             while ((next = sv.find(';', last)) != std::string::npos) {
                 label = stab.intern(sv.substr(last, next - last));
@@ -214,8 +215,11 @@ struct Flame_Graph {
                 last = next + 1;
                 depth += 1;
             }
-            label = stab.intern(s.substr(last));
-            depth += 1;
+            if (last < sv.size()) {
+                label = stab.intern(sv.substr(last));
+                f = f->add_frame(label, count);
+                depth += 1;
+            }
 
             if (depth > this->max_depth) { this->max_depth = depth; }
         }
@@ -232,8 +236,8 @@ struct Flame_Graph {
             yed_buff_clear_no_undo(this->buffer);
             for (size_t i = 1; i < this->max_depth; i += 1) { yed_buffer_add_line_no_undo(this->buffer); }
 
-            std::function<void(std::shared_ptr<Frame>, size_t, size_t, size_t, int)>
-            write_frame = [&write_frame,this](std::shared_ptr<Frame> f, size_t start_col, size_t width, size_t depth, int first_child) {
+            std::function<void(Frame*, size_t, size_t, size_t)>
+            write_frame = [&write_frame,this](Frame *f, size_t start_col, size_t width, size_t depth) {
 
                 /* Allow a one column flame to show that there's something there even if we can't read it. */
                 if (width < 1) { return; }
@@ -261,17 +265,6 @@ struct Flame_Graph {
 
                 f->cleaned_up_label = stab.intern(s);
 
-//                 if (first_child) {
-//                     s.insert(s.begin(), '|');
-//                 }
-
-//                 if (s.size() > width - 1 && width > !!first_child + 3) {
-//                     s[width - 3] = '.';
-//                     s[width - 2] = '.';
-//                 }
-
-//                 s = s.substr(0, width - 1);
-
                 if (width == 1) {
                     s = "";
                 } else {
@@ -286,11 +279,30 @@ struct Flame_Graph {
                 yed_buff_insert_string_no_undo(this->buffer, s.c_str(), depth, start_col);
 
                 size_t child_off = 0;
-                for (auto pair : f->children) {
-                    auto child = pair.second;
-                    size_t child_width = ((float)child->count / (float)f->count) * width;
+                std::vector<Frame*> sorted_children;
 
-                    write_frame(child, start_col + child_off, child_width, depth - 1, child_off == 0);
+                for (auto pair : f->children) {
+                    auto pos = std::lower_bound(
+                        sorted_children.begin(),
+                        sorted_children.end(),
+                        pair.second.get(),
+                        [](Frame *a, Frame *b) -> bool { return a->count > b->count; });
+                    sorted_children.insert(pos, pair.second.get());
+                }
+
+
+                for (auto child : sorted_children) {
+                    size_t child_width = ((float)child->count / (float)f->count) * width;
+                    if (child_width < 1) { child_width = 1; }
+
+                    if (child_off + child_width >= width) {
+                        child_width = width - child_off;
+                        if (child_width == 0) {
+                            break;
+                        }
+                    }
+
+                    write_frame(child, start_col + child_off, child_width, depth - 1);
                     child_off += child_width;
                 }
                 yed_buff_insert_string_no_undo(this->buffer, " ", depth, start_col + width - 1);
@@ -306,7 +318,7 @@ struct Flame_Graph {
                 this->frame_info[depth].push_back(info);
             };
 
-            write_frame(this->get_base(), 1, width, this->max_depth, 1);
+            write_frame(this->get_base(), 1, width, this->max_depth);
         }
 
         const Frame_Info *get_info(int row, int col) {
@@ -330,17 +342,17 @@ struct Flame_Graph {
         }
 
         int reset_zoom(size_t width) {
-            if (this->get_base() == this->true_base) { return 0; }
+            if (this->get_base() == this->true_base.get()) { return 0; }
 
             this->base_stack.clear();
-            this->base_stack.push_back(this->true_base);
+            this->base_stack.push_back(this->true_base.get());
             this->write_buffer(width);
 
             return 1;
         }
 
         int return_zoom(size_t width) {
-            if (this->get_base() == this->true_base) { return 0; }
+            if (this->get_base() == this->true_base.get()) { return 0; }
 
             this->base_stack.pop_back();
             this->write_buffer(width);
@@ -550,7 +562,7 @@ static void info_popup(Flame_Graph *graph, int row, int col) {
     popup->add_text(info->frame->cleaned_up_label);
 
     char buff[512];
-    if (graph->get_base() == graph->true_base) {
+    if (graph->get_base() == graph->true_base.get()) {
         snprintf(buff, sizeof(buff), "%zu samples (%.2f%% of all)", info->frame->count, 100.0 * (float)info->frame->count / (float)graph->get_base()->count);
     } else {
         snprintf(buff, sizeof(buff), "%zu samples (%.2f%% of total shown, %.2f%% of all)", info->frame->count, 100.0 * (float)info->frame->count / (float)graph->get_base()->count, 100.0 * (float)info->frame->count / (float)graph->true_base->count);
@@ -787,7 +799,7 @@ static void update(yed_event *event) {
 
     if (graph == NULL) { return; }
 
-    search(graph->get_base().get());
+    search(graph->get_base());
 }
 
 static void color(yed_event *event) {
@@ -813,7 +825,7 @@ static void color(yed_event *event) {
                &&  info.start_col <= frame->cursor_col && frame->cursor_col <= info.end_col) {
 
             attrs = yed_parse_attrs("&black bg ff0000");
-        } else if (search_match_frames.find(info.frame.get()) != search_match_frames.end()) {
+        } else if (search_match_frames.find(info.frame) != search_match_frames.end()) {
             attrs = yed_parse_attrs("&black bg 7722ff");
         } else {
             using Frame_Type = Flame_Graph::Frame_Type;

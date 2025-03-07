@@ -23,6 +23,14 @@ Display a popup with information for the frame under the cursor. Bound to the SP
 .P
 See https://www.brendangregg.com/flamegraphs.html
 
+This implementation of flame graphs is different in one significant way: frames
+are sorted left to right in descending order of sample count rather than
+alphabetically. This can make it easier to quickly scan for problem paths.
+Additionally, since this is drawn in the terminal, some information loss is
+inevitable (it makes an effort to draw every a flame for every code path, but
+there are a limited number of columns to work with). This sorting order reduces
+the likelyhood that important (read high sample count) frames are lost.
+
 Assumes truecolor support.
 .SH VERSION
 0.0.1
