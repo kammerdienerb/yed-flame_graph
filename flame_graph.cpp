@@ -472,7 +472,7 @@ static void flame_graph(int n_args, char **args) {
 
     graph.write_buffer(ys->active_frame == NULL ? 120 : ys->active_frame->width);
 
-    DBG("took %llu ns to build %s", measure_time_now_ms() - start, graph.name.c_str());
+    DBG("took %llu ms to build %s", measure_time_now_ms() - start, graph.name.c_str());
 
     YEXE("buffer", (char*)graph.name.c_str());
     YEXE("cursor-buffer-end");
