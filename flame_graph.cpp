@@ -1,6 +1,7 @@
 #include <memory>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <string_view>
@@ -87,27 +88,33 @@ do {                                                               \
 
 static void unload(yed_plugin *self) {}
 
+
+struct Char_Pointer_Hash {
+    auto operator()(const char *ptr) const noexcept {
+        return std::hash<std::string_view>{}(ptr);
+    }
+};
+
+struct Interned_String_Hash {
+    auto operator()(const char *ptr) const noexcept {
+        return ((size_t)ptr) >> 3;
+    }
+};
+
+template<typename ... Bases>
+struct Overload : Bases ... {
+    using is_transparent = void;
+    using Bases::operator() ... ;
+};
+
+using Transparent_String_Hash = Overload<
+    std::hash<std::string>,
+    std::hash<std::string_view>,
+    Char_Pointer_Hash
+>;
+
+
 struct String_Intern_Table {
-    template<typename ... Bases>
-    struct Overload : Bases ... {
-        using is_transparent = void;
-        using Bases::operator() ... ;
-    };
-
-
-    struct Char_Pointer_Hash {
-        auto operator()(const char *ptr) const noexcept {
-            return std::hash<std::string_view>{}(ptr);
-        }
-    };
-
-    using Transparent_String_Hash = Overload<
-        std::hash<std::string>,
-        std::hash<std::string_view>,
-        Char_Pointer_Hash
-    >;
-
-
     std::unordered_set<std::string, Transparent_String_Hash, std::equal_to<>> tab;
 
     const char *intern(const std::string_view &sv) {
@@ -115,7 +122,7 @@ struct String_Intern_Table {
         if (lookup != this->tab.end()) {
             return lookup->data();
         }
-        return this->tab.insert(std::string(sv)).first->data();
+        return this->tab.emplace(sv).first->data();
     }
 };
 
@@ -141,20 +148,28 @@ struct Flame_Graph {
             const char                       *label            = NULL;
             const char                       *cleaned_up_label = NULL;
             size_t                            count            = 0;
-            std::map<const char*,
+            std::unordered_map<const char*,
                      std::shared_ptr<Frame>,
-                     String_Compare>          children;
-            Frame                            *parent;
+                     Interned_String_Hash>    children;
+            Frame                            *parent           = NULL;
 
             Frame *add_frame(const char *label, size_t count) {
-                auto f = this->children[label];
+                auto pair = this->children.try_emplace(label, nullptr);
+
+                auto f = pair.first->second.get();
+
                 if (!f) {
-                    f = this->children[label] = std::make_shared<Frame>();
+                    pair.first->second = std::make_shared<Frame>();
+
+                    f = pair.first->second.get();
+
                     f->parent = this;
                     f->label  = label;
                 }
+
                 f->count += count;
-                return f.get();
+
+                return f;
             }
         };
 
@@ -168,12 +183,12 @@ struct Flame_Graph {
         };
 
 
-        std::shared_ptr<Frame>                  true_base;
-        std::vector<Frame*>                     base_stack;
-        std::string                             name;
-        yed_buffer                             *buffer = NULL;
-        size_t                                  max_depth = 0;
-        std::map<u64, std::vector<Frame_Info>>  frame_info;
+        std::shared_ptr<Frame>                            true_base;
+        std::vector<Frame*>                               base_stack;
+        std::string                                       name;
+        yed_buffer                                       *buffer = NULL;
+        size_t                                            max_depth = 0;
+        std::unordered_map<u64, std::vector<Frame_Info>>  frame_info;
 
         Flame_Graph() : true_base(std::make_shared<Frame>()) {
             this->base_stack.push_back(this->true_base.get());
@@ -246,15 +261,20 @@ struct Flame_Graph {
 
                 std::string s = f->label;
 
+                int label_cleaned_up = 0;
+
                 if (s.ends_with("_[g]")) {
                     type = Frame_Type::GPU_INST;
                     s.erase(s.size() - 4);
+                    label_cleaned_up = 1;
                 } else if (s.ends_with("_[G]")) {
                     type = Frame_Type::GPU_SYMBOL;
                     s.erase(s.size() - 4);
+                    label_cleaned_up = 1;
                 } else if (s.ends_with("_[k]")) {
                     type = Frame_Type::KERNEL;
                     s.erase(s.size() - 4);
+                    label_cleaned_up = 1;
                 } else if (s.starts_with("py::")) {
                     type = Frame_Type::PYTHON;
                 } else if (s.find("::") != std::string::npos) {
@@ -263,7 +283,11 @@ struct Flame_Graph {
                     type = Frame_Type::DIVIDER;
                 }
 
-                f->cleaned_up_label = stab.intern(s);
+                if (label_cleaned_up) {
+                    f->cleaned_up_label = stab.intern(s);
+                } else {
+                    f->cleaned_up_label = f->label;
+                }
 
                 if (width == 1) {
                     s = "";
