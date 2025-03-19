@@ -239,7 +239,7 @@ struct Flame_Graph {
             if (depth > this->max_depth) { this->max_depth = depth; }
         }
 
-        void write_buffer(size_t width) {
+        void write_buffer(size_t height, size_t width) {
             if (this->buffer == NULL) {
                 this->buffer = yed_get_or_create_special_rdonly_buffer((char*)this->name.c_str());
             }
@@ -249,7 +249,7 @@ struct Flame_Graph {
             BUFF_WRITABLE_GUARD(this->buffer);
 
             yed_buff_clear_no_undo(this->buffer);
-            for (size_t i = 1; i < this->max_depth; i += 1) { yed_buffer_add_line_no_undo(this->buffer); }
+            for (size_t i = 1; i < MAX(height, this->max_depth); i += 1) { yed_buffer_add_line_no_undo(this->buffer); }
 
             std::function<void(Frame*, size_t, size_t, size_t)>
             write_frame = [&write_frame,this](Frame *f, size_t start_col, size_t width, size_t depth) {
@@ -342,7 +342,7 @@ struct Flame_Graph {
                 this->frame_info[depth].push_back(info);
             };
 
-            write_frame(this->get_base(), 1, width, this->max_depth);
+            write_frame(this->get_base(), 1, width, MAX(height, this->max_depth));
         }
 
         const Frame_Info *get_info(int row, int col) {
@@ -354,32 +354,32 @@ struct Flame_Graph {
             return NULL;
         }
 
-        int zoom(int row, int col, size_t width) {
+        int zoom(int row, int col, size_t height, size_t width) {
             const Frame_Info *info = get_info(row, col);
 
             if (info == NULL) { return 0; }
 
             this->base_stack.push_back(info->frame);
-            this->write_buffer(width);
+            this->write_buffer(height, width);
 
             return 1;
         }
 
-        int reset_zoom(size_t width) {
+        int reset_zoom(size_t height, size_t width) {
             if (this->get_base() == this->true_base.get()) { return 0; }
 
             this->base_stack.clear();
             this->base_stack.push_back(this->true_base.get());
-            this->write_buffer(width);
+            this->write_buffer(height, width);
 
             return 1;
         }
 
-        int return_zoom(size_t width) {
+        int return_zoom(size_t height, size_t width) {
             if (this->get_base() == this->true_base.get()) { return 0; }
 
             this->base_stack.pop_back();
-            this->write_buffer(width);
+            this->write_buffer(height, width);
 
             return 1;
         }
@@ -494,7 +494,7 @@ static void flame_graph(int n_args, char **args) {
 
     popup.reset();
 
-    graph.write_buffer(ys->active_frame == NULL ? 120 : ys->active_frame->width);
+    graph.write_buffer(ys->active_frame == NULL ? 120 : ys->active_frame->height, ys->active_frame == NULL ? 120 : ys->active_frame->width);
 
     DBG("took %llu ms to build %s", measure_time_now_ms() - start, graph.name.c_str());
 
@@ -523,7 +523,7 @@ static void flame_graph_zoom(int n_args, char **args) {
 
     popup.reset();
 
-    if (graph->zoom(frame->cursor_line, frame->cursor_col, frame->width)) {
+    if (graph->zoom(frame->cursor_line, frame->cursor_col, frame->height, frame->width)) {
         YEXE("cursor-buffer-end");
         YEXE("cursor-line-begin");
     }
@@ -549,7 +549,7 @@ static void flame_graph_reset_zoom(int n_args, char **args) {
 
     popup.reset();
 
-    if (graph->reset_zoom(frame->width)) {
+    if (graph->reset_zoom(frame->height, frame->width)) {
         YEXE("cursor-buffer-end");
         YEXE("cursor-line-begin");
     }
@@ -575,7 +575,7 @@ static void flame_graph_return_zoom(int n_args, char **args) {
 
     popup.reset();
 
-    if (graph->return_zoom(frame->width)) {
+    if (graph->return_zoom(frame->height, frame->width)) {
         YEXE("cursor-buffer-end");
         YEXE("cursor-line-begin");
     }
@@ -744,6 +744,7 @@ static void fit(yed_event *event) {
     for (auto &pair : flame_graphs) {
         auto       &g = pair.second;
         int         in_frame;
+        int         height;
         int         width;
         yed_frame **fit;
         yed_frame  *f;
@@ -758,12 +759,13 @@ static void fit(yed_event *event) {
             in_frame = 1;
 
             if (f->width < width) {
-                width = f->width;
+                height = f->height;
+                width  = f->width;
             }
         }
 
         if (in_frame) {
-            g.write_buffer(width);
+            g.write_buffer(height, width);
         }
     }
     popup.reset();
@@ -969,11 +971,11 @@ static void key(yed_event *event) {
 
     if (MOUSE_BUTTON(event->key) == MOUSE_BUTTON_LEFT) {
         if (graph->get_info(row, col) == NULL) {
-            graph->return_zoom(frame->width);
+            graph->return_zoom(frame->height, frame->width);
             YEXE("cursor-buffer-end");
             YEXE("cursor-line-begin");
         } else {
-            graph->zoom(row, col, frame->width);
+            graph->zoom(row, col, frame->height, frame->width);
             YEXE("cursor-buffer-end");
             YEXE("cursor-line-begin");
         }
